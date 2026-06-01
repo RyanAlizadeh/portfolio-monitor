@@ -44,6 +44,9 @@ EXAMPLE_CSV = textwrap.dedent("""\
 
 # ── Core computation functions ────────────────────────────────
 
+# Rows with these ticker values are silently skipped — not real securities
+_SKIP_TICKERS = {"CASH", "USD", "CAD", "GBP", "EUR"}
+
 def load_purchases_from_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [c.strip().lower() for c in df.columns]
@@ -55,6 +58,20 @@ def load_purchases_from_df(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"Missing columns: {missing}")
     if df["amount"].lt(0).any():
         raise ValueError("All amounts must be non-negative.")
+    # Drop known non-security rows and anything that looks like an internal code
+    # (contains digits or is in the skip list)
+    def is_valid_ticker(t):
+        if t in _SKIP_TICKERS:
+            return False
+        if any(c.isdigit() for c in t):
+            return False
+        return True
+    before = len(df)
+    df = df[df["ticker"].apply(is_valid_ticker)].copy()
+    skipped_n = before - len(df)
+    if skipped_n > 0:
+        import streamlit as _st
+        _st.info(f"ℹ️ {skipped_n} rows skipped — tickers that aren't recognisable securities (e.g. CASH, internal codes).")
     return df.sort_values("purchase_date").reset_index(drop=True)
 
 
@@ -72,7 +89,35 @@ def download_prices(tickers: List[str], start_date: pd.Timestamp) -> pd.DataFram
         prices = data["Close"].copy()
     else:
         prices = data.to_frame(name=tickers[0])
-    return prices.dropna(how="all").ffill()
+    prices = prices.dropna(how="all").ffill()
+
+    # For any ticker that came back empty, retry with .TO suffix (TSX securities)
+    missing = [t for t in tickers if t not in prices.columns or prices[t].dropna().empty]
+    retry = [t for t in missing if not t.endswith(".TO")]
+    if retry:
+        retry_to = [t + ".TO" for t in retry]
+        data2 = yf.download(
+            tickers=retry_to,
+            start=start_date.strftime("%Y-%m-%d"),
+            auto_adjust=True,
+            actions=True,
+            progress=False,
+            group_by="column",
+            threads=False,
+        )
+        if isinstance(data2.columns, pd.MultiIndex):
+            prices2 = data2["Close"].copy()
+        else:
+            prices2 = data2.to_frame(name=retry_to[0]) if len(retry_to) == 1 else pd.DataFrame()
+        prices2 = prices2.dropna(how="all").ffill()
+        # Map .TO columns back to the original bare ticker name
+        rename_map = {t + ".TO": t for t in retry}
+        prices2 = prices2.rename(columns=rename_map)
+        for col in prices2.columns:
+            if col in rename_map.values() and not prices2[col].dropna().empty:
+                prices[col] = prices2[col]
+
+    return prices
 
 
 def purchases_to_trades(purchases: pd.DataFrame, prices: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -120,13 +165,28 @@ def xirr(cashflows: list) -> float:
     amounts = [cf[1] for cf in cashflows]
     t0      = dates[0]
     years   = [(d - t0).days / 365.0 for d in dates]
+
+    def safe_npv(rate):
+        try:
+            return sum(a / (1 + rate) ** t for a, t in zip(amounts, years))
+        except (OverflowError, ZeroDivisionError):
+            return np.nan
+
+    def safe_npv_deriv(rate):
+        try:
+            return sum(-t * a / (1 + rate) ** (t + 1) for a, t in zip(amounts, years))
+        except (OverflowError, ZeroDivisionError):
+            return np.nan
+
     rate = 0.1
     for _ in range(200):
-        f  = sum(a / (1 + rate) ** t for a, t in zip(amounts, years))
-        df = sum(-t * a / (1 + rate) ** (t + 1) for a, t in zip(amounts, years))
-        if df == 0:
+        f  = safe_npv(rate)
+        df = safe_npv_deriv(rate)
+        if pd.isna(f) or pd.isna(df) or df == 0:
             break
         nr = rate - f / df
+        # Clamp to prevent runaway values on short histories
+        nr = max(-0.999, min(nr, 100.0))
         if abs(nr - rate) < 1e-8:
             return nr
         rate = nr
