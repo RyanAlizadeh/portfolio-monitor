@@ -155,7 +155,11 @@ def build_units_matrix(trades: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFra
 
 def build_portfolio_value(units_matrix: pd.DataFrame, prices: pd.DataFrame) -> pd.Series:
     common = [c for c in units_matrix.columns if c in prices.columns]
-    return (units_matrix[common] * prices[common]).sum(axis=1)
+    # Forward-fill each ticker's price independently before multiplying
+    # so a single missing price day doesn't zero out the whole portfolio
+    filled_prices = prices[common].ffill()
+    daily_values = units_matrix[common] * filled_prices
+    return daily_values.sum(axis=1)
 
 
 def xirr(cashflows: list) -> float:
@@ -220,7 +224,7 @@ def sharpe(ann_ret: float, ann_vol: float, rfr: float) -> float:
 
 
 def build_benchmark_series(ticker: str, purchases: pd.DataFrame, prices: pd.DataFrame) -> pd.Series:
-    series = prices[ticker].dropna()
+    series = prices[ticker].ffill().dropna()
     by_date = purchases.groupby("purchase_date")["amount"].sum().reset_index()
     units_ch = pd.Series(0.0, index=series.index)
     for _, row in by_date.iterrows():
@@ -244,9 +248,16 @@ def compute_all(purchases: pd.DataFrame) -> dict:
     with st.spinner("Downloading price history from Yahoo Finance…"):
         prices = download_prices(all_tickers, start)
 
-    missing = [t for t in all_tickers if t not in prices.columns]
-    if missing:
-        raise ValueError(f"Could not find price data for: {missing}. Check ticker symbols.")
+    # Identify tickers with no usable price data
+    no_data = [t for t in purchases["ticker"].unique()
+               if t not in prices.columns or prices[t].dropna().empty]
+    excluded_rows = pd.DataFrame()
+    if no_data:
+        excluded_rows = purchases[purchases["ticker"].isin(no_data)].copy()
+        purchases = purchases[~purchases["ticker"].isin(no_data)].copy()
+
+    if purchases.empty:
+        raise ValueError("No priceable securities found. Check your ticker symbols.")
 
     trades, skipped = purchases_to_trades(purchases, prices)
     if trades.empty:
@@ -289,6 +300,8 @@ def compute_all(purchases: pd.DataFrame) -> dict:
         "prices":          prices,
         "trades":          trades,
         "skipped":         skipped,
+        "excluded_rows":   excluded_rows,
+        "no_data_tickers": no_data,
         "portfolio_vals":  portfolio_vals,
         "total_invested":  total_invested,
         "current_val":     current_val,
@@ -392,11 +405,45 @@ if uploaded is not None:
         st.error(f"Error running analysis: {e}")
         st.stop()
 
-    pm   = results["port_metrics"]
-    bm   = results["bm_metrics"]
-    ti   = results["total_invested"]
-    cv   = results["current_val"]
-    gain = cv - ti
+    pm          = results["port_metrics"]
+    bm          = results["bm_metrics"]
+    ti          = results["total_invested"]
+    cv          = results["current_val"]
+    gain        = cv - ti
+    no_data     = results["no_data_tickers"]
+    excluded    = results["excluded_rows"]
+
+    # ── Missing data alert ────────────────────────────────────
+    if no_data:
+        excluded_summary = (
+            excluded.groupby("ticker")["amount"]
+            .agg(purchases="count", total_amount="sum")
+            .reset_index()
+            .rename(columns={"ticker": "Ticker", "purchases": "# Purchases", "total_amount": "$ Amount in CSV"})
+        )
+        excluded_summary["$ Amount in CSV"] = excluded_summary["$ Amount in CSV"].apply(money)
+        excluded_total = excluded["amount"].sum()
+
+        excl_msg = (
+            f"⚠️ **Pricing data missing for {len(no_data)} ticker(s) — "
+            f"${excluded_total:,.2f} excluded from analysis**\n\n"
+            "These securities could not be priced and are not included in your portfolio value or returns. "
+            "Your results are understated by the amounts shown below."
+        )
+        st.error(excl_msg)
+        with st.expander(f"See excluded tickers ({len(no_data)})", expanded=True):
+            st.dataframe(excluded_summary.set_index("Ticker"), use_container_width=True)
+            st.markdown("""
+**Why might a ticker be missing?**
+- **Wrong symbol** — Canadian ETFs need `.TO` suffix (e.g. `VFV.TO` not `VFV`). US stocks use their plain symbol (e.g. `AAPL`, `VXUS`).
+- **Options / warrants** — these have no continuous price history on Yahoo Finance
+- **GICs / structured notes** — not exchange-traded, no ticker
+- **Internal account codes** — brokerage-specific labels that aren't real tickers
+- **Delisted or renamed** — the security may have changed its symbol
+
+**What to do:** Check each ticker at [finance.yahoo.com](https://finance.yahoo.com), search for the security, and copy the exact symbol shown. Update your CSV and re-upload.
+""")
+        st.divider()
 
     # ── Summary cards ─────────────────────────────────────────
     st.subheader("Portfolio Summary")
