@@ -20,14 +20,14 @@ st.set_page_config(
 )
 
 # ── Constants ────────────────────────────────────────────────
-BENCHMARKS = {
+DEFAULT_BENCHMARKS = {
     "SP500 (VFV.TO)":  "VFV.TO",
     "NASDAQ (XQQ.TO)": "XQQ.TO",
     "XEQT (XEQT.TO)":  "XEQT.TO",
 }
-RISK_FREE_RATE     = 0.03
-MAX_LOOKAHEAD_DAYS = 5
-_SKIP_TICKERS      = {"CASH", "USD", "CAD", "GBP", "EUR"}
+DEFAULT_RISK_FREE_RATE = 0.03
+MAX_LOOKAHEAD_DAYS     = 5
+_SKIP_TICKERS          = {"CASH", "USD", "CAD", "GBP", "EUR"}
 
 EXAMPLE_CSV = textwrap.dedent("""\
     date,ticker,amount,type
@@ -492,9 +492,63 @@ def build_security_attribution(txns: pd.DataFrame,
     return df
 
 
+# ── Drawdown ─────────────────────────────────────────────────
+def compute_drawdown(series: pd.Series) -> pd.Series:
+    s = series.dropna()
+    return (s - s.cummax()) / s.cummax()
+
+
+# ── Rolling period returns ────────────────────────────────────
+def compute_rolling_returns(
+    portfolio_vals: pd.Series,
+    bm_series: dict,
+) -> pd.DataFrame:
+    """
+    Simple time-weighted period returns for standard lookback windows.
+    Uses the portfolio/benchmark value series directly (not XIRR).
+    """
+    today = portfolio_vals.dropna().index[-1]
+
+    periods = {
+        "YTD": pd.Timestamp(today.year, 1, 1),
+        "1M":  today - pd.DateOffset(months=1),
+        "3M":  today - pd.DateOffset(months=3),
+        "6M":  today - pd.DateOffset(months=6),
+        "1Y":  today - pd.DateOffset(years=1),
+        "3Y":  today - pd.DateOffset(years=3),
+    }
+
+    def period_return(series: pd.Series, start: pd.Timestamp) -> float:
+        s = series.dropna()
+        candidates = s.index[s.index >= start]
+        if len(candidates) == 0 or len(s) == 0:
+            return np.nan
+        start_val = float(s.loc[candidates[0]])
+        end_val   = float(s.iloc[-1])
+        if start_val <= 0:
+            return np.nan
+        return end_val / start_val - 1
+
+    rows = {}
+    rows["PORTFOLIO"] = {
+        label: period_return(portfolio_vals, start)
+        for label, start in periods.items()
+    }
+    for name, series in bm_series.items():
+        rows[name] = {
+            label: period_return(series, start)
+            for label, start in periods.items()
+        }
+
+    df = pd.DataFrame(rows).T
+    df.index.name = ""
+    return df
+
+
 # ── Main computation ─────────────────────────────────────────
-def compute_all(txns: pd.DataFrame) -> dict:
-    all_tickers = list(txns["ticker"].unique()) + list(BENCHMARKS.values())
+def compute_all(txns: pd.DataFrame, benchmarks: dict,
+                risk_free_rate: float) -> dict:
+    all_tickers = list(txns["ticker"].unique()) + list(benchmarks.values())
     all_tickers = list(dict.fromkeys(all_tickers))
     start       = txns["date"].min()
 
@@ -530,12 +584,12 @@ def compute_all(txns: pd.DataFrame) -> dict:
     port_metrics["sharpe"] = sharpe_ratio(
         port_metrics["annualized_return"],
         port_metrics["annualized_volatility"],
-        RISK_FREE_RATE,
+        risk_free_rate,
     )
 
     bm_series = {
         name: build_benchmark_series(ticker, txns, prices)
-        for name, ticker in BENCHMARKS.items()
+        for name, ticker in benchmarks.items()
         if ticker in prices.columns
     }
 
@@ -545,15 +599,16 @@ def compute_all(txns: pd.DataFrame) -> dict:
         ar     = annualized_return_metric(txns, bm_val)
         av     = annualized_vol(series, trade_dates)
         bm_metrics[name] = {
-            "ticker":                BENCHMARKS[name],
+            "ticker":                benchmarks[name],
             "total_return":          total_return_metric(txns, bm_val),
             "annualized_return":     ar,
             "annualized_volatility": av,
-            "sharpe":                sharpe_ratio(ar, av, RISK_FREE_RATE),
+            "sharpe":                sharpe_ratio(ar, av, risk_free_rate),
         }
 
     holdings    = build_holdings_table(units_matrix, prices)
     attribution = build_security_attribution(txns, units_matrix, prices)
+    rolling     = compute_rolling_returns(portfolio_vals, bm_series)
 
     return {
         "txns":              txns,
@@ -568,7 +623,54 @@ def compute_all(txns: pd.DataFrame) -> dict:
         "bm_metrics":        bm_metrics,
         "holdings":          holdings,
         "attribution":       attribution,
+        "rolling":           rolling,
     }
+
+
+# ════════════════════════════════════════════════════════════
+# SIDEBAR — settings (rendered before main body)
+# ════════════════════════════════════════════════════════════
+
+with st.sidebar:
+    st.header("⚙️ Settings")
+
+    # ── Benchmark configuration ───────────────────────────────
+    st.subheader("Benchmarks")
+    selected_default_names = st.multiselect(
+        "Built-in benchmarks",
+        options=list(DEFAULT_BENCHMARKS.keys()),
+        default=list(DEFAULT_BENCHMARKS.keys()),
+        help="Select which default benchmarks to include in the analysis.",
+    )
+    custom_ticker_input = st.text_input(
+        "Add custom benchmark (Yahoo Finance ticker)",
+        placeholder="e.g. SPY, QQQ, IVV",
+        help="Enter any Yahoo Finance ticker to add it as a benchmark.",
+    ).strip().upper()
+
+    # Build the active benchmarks dict
+    ACTIVE_BENCHMARKS = {k: DEFAULT_BENCHMARKS[k] for k in selected_default_names}
+    if custom_ticker_input:
+        # Use the ticker itself as the display name
+        ACTIVE_BENCHMARKS[custom_ticker_input] = custom_ticker_input
+
+    st.divider()
+
+    # ── Risk-free rate ────────────────────────────────────────
+    st.subheader("Risk-free Rate")
+    RISK_FREE_RATE = st.number_input(
+        "Annual risk-free rate (%)",
+        min_value=0.0,
+        max_value=20.0,
+        value=DEFAULT_RISK_FREE_RATE * 100,
+        step=0.25,
+        format="%.2f",
+        help="Used to compute Sharpe ratio. Default is 3% (approximate T-bill rate).",
+    ) / 100.0
+
+    st.divider()
+    st.caption("Date range filter appears here after you upload a CSV.")
+    sidebar_date_placeholder = st.empty()
 
 
 # ════════════════════════════════════════════════════════════
@@ -638,7 +740,8 @@ if uploaded is not None:
     )
 
     try:
-        results = compute_all(txns)
+        results = compute_all(txns, benchmarks=ACTIVE_BENCHMARKS,
+                              risk_free_rate=RISK_FREE_RATE)
     except Exception as e:
         st.error(f"Error running analysis: {e}")
         st.stop()
@@ -647,6 +750,34 @@ if uploaded is not None:
     bm       = results["bm_metrics"]
     no_data  = results["no_data_tickers"]
     excluded = results["excluded_rows"]
+
+    # ── Date range filter (rendered into the sidebar placeholder) ──
+    port_vals_full = results["portfolio_vals"].dropna()
+    data_start = port_vals_full.index.min().date()
+    data_end   = port_vals_full.index.max().date()
+
+    with sidebar_date_placeholder.container():
+        st.subheader("Chart Date Range")
+        date_range = st.date_input(
+            "Select range",
+            value=(data_start, data_end),
+            min_value=data_start,
+            max_value=data_end,
+            help="Filters the growth and drawdown charts. Summary metrics remain inception-to-date.",
+        )
+
+    # Unpack date range (user may have selected only start while picking)
+    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+        filter_start = pd.Timestamp(date_range[0])
+        filter_end   = pd.Timestamp(date_range[1])
+    else:
+        filter_start = pd.Timestamp(data_start)
+        filter_end   = pd.Timestamp(data_end)
+
+    def apply_date_filter(series: pd.Series) -> pd.Series:
+        return series.loc[
+            (series.index >= filter_start) & (series.index <= filter_end)
+        ]
 
     # ── Missing data alert ────────────────────────────────────
     if no_data:
@@ -702,16 +833,28 @@ if uploaded is not None:
 
     st.divider()
 
-    # ── Chart ─────────────────────────────────────────────────
+    # ── Growth chart ──────────────────────────────────────────
     st.subheader("Growth of $100 — Portfolio vs Benchmarks")
     st.caption(
         "Normalized against net invested capital (buys minus sells). "
-        "Benchmarks mirror your exact buy and sell timing."
+        "Benchmarks mirror your exact buy and sell timing. "
+        "Use the date range filter in the sidebar to zoom in."
     )
 
-    fig        = go.Figure()
-    port_vals  = results["portfolio_vals"]
-    norm_base  = ni  # normalize against net invested
+    # Colour palette — default benchmarks get fixed colours, custom get auto
+    _BM_COLORS = {
+        "SP500 (VFV.TO)":  "#3b82f6",
+        "NASDAQ (XQQ.TO)": "#f97316",
+        "XEQT (XEQT.TO)":  "#22c55e",
+    }
+    _AUTO_COLORS = ["#a855f7", "#06b6d4", "#f43f5e", "#eab308", "#14b8a6"]
+
+    def bm_color(name: str, idx: int) -> str:
+        return _BM_COLORS.get(name, _AUTO_COLORS[idx % len(_AUTO_COLORS)])
+
+    fig       = go.Figure()
+    port_vals = apply_date_filter(results["portfolio_vals"])
+    norm_base = ni
 
     port_norm = port_vals / norm_base * 100
     fig.add_trace(go.Scatter(
@@ -721,23 +864,19 @@ if uploaded is not None:
         fill="tozeroy", fillcolor="rgba(15,23,42,0.07)",
     ))
 
-    bm_colors = {
-        "SP500 (VFV.TO)":  "#3b82f6",
-        "NASDAQ (XQQ.TO)": "#f97316",
-        "XEQT (XEQT.TO)":  "#22c55e",
-    }
-    for name, series in results["bm_series"].items():
-        norm = series / norm_base * 100
+    for idx, (name, series) in enumerate(results["bm_series"].items()):
+        filtered = apply_date_filter(series)
+        norm     = filtered / norm_base * 100
         fig.add_trace(go.Scatter(
             x=norm.index, y=norm.values,
             name=name,
-            line=dict(color=bm_colors.get(name, "#94a3b8"), width=1.5),
+            line=dict(color=bm_color(name, idx), width=1.5),
         ))
 
     fig.add_hline(y=100, line_dash="dot", line_color="#94a3b8",
                   annotation_text="Break-even", annotation_position="bottom right")
 
-    fig.update_layout(
+    _chart_layout = dict(
         height=420,
         margin=dict(l=0, r=0, t=10, b=0),
         legend=dict(
@@ -747,15 +886,12 @@ if uploaded is not None:
             bordercolor="#e2e8f0", borderwidth=1,
         ),
         xaxis=dict(
-            showgrid=False,
-            linecolor="#2d2d2d",
+            showgrid=False, linecolor="#2d2d2d",
             tickfont=dict(color="#2d2d2d", size=12),
             title_font=dict(color="#2d2d2d"),
         ),
         yaxis=dict(
-            title="Growth of 100",
-            gridcolor="#e2e8f0",
-            linecolor="#2d2d2d",
+            title="Growth of 100", gridcolor="#e2e8f0", linecolor="#2d2d2d",
             tickfont=dict(color="#2d2d2d", size=12),
             title_font=dict(color="#2d2d2d"),
         ),
@@ -763,7 +899,42 @@ if uploaded is not None:
         plot_bgcolor="white", paper_bgcolor="white",
         hovermode="x unified",
     )
+    fig.update_layout(**_chart_layout)
     st.plotly_chart(fig, use_container_width=True)
+
+    # ── Drawdown chart ────────────────────────────────────────
+    st.subheader("Drawdown")
+    st.caption(
+        "Peak-to-trough decline from each series' prior high. "
+        "Shows how far each portfolio / benchmark fell at its worst point in the selected window."
+    )
+
+    dd_fig = go.Figure()
+    port_dd = compute_drawdown(apply_date_filter(results["portfolio_vals"])) * 100
+    dd_fig.add_trace(go.Scatter(
+        x=port_dd.index, y=port_dd.values,
+        name="PORTFOLIO",
+        line=dict(color="#0f172a", width=2.5),
+        fill="tozeroy", fillcolor="rgba(15,23,42,0.07)",
+    ))
+    for idx, (name, series) in enumerate(results["bm_series"].items()):
+        bm_dd = compute_drawdown(apply_date_filter(series)) * 100
+        dd_fig.add_trace(go.Scatter(
+            x=bm_dd.index, y=bm_dd.values,
+            name=name,
+            line=dict(color=bm_color(name, idx), width=1.5),
+        ))
+
+    dd_fig.update_layout(
+        **{**_chart_layout,
+           "yaxis": {
+               **_chart_layout["yaxis"],
+               "title": "Drawdown (%)",
+               "ticksuffix": "%",
+           }
+        }
+    )
+    st.plotly_chart(dd_fig, use_container_width=True)
 
     st.divider()
 
@@ -789,6 +960,17 @@ if uploaded is not None:
         "Sharpe-like":           num(pm["sharpe"]),
     })
     st.dataframe(pd.DataFrame(table_rows).set_index(""), use_container_width=True)
+
+    # ── Rolling period returns ────────────────────────────────
+    st.subheader("Rolling Period Returns")
+    st.caption(
+        "Simple time-weighted returns for standard lookback windows (not XIRR). "
+        "Periods shorter than the portfolio's history show N/A."
+    )
+    rolling_df = results["rolling"].copy()
+    # Format all cells as percentages
+    rolling_fmt = rolling_df.apply(lambda col: col.map(lambda x: pct(x) if pd.notna(x) else "—"))
+    st.dataframe(rolling_fmt, use_container_width=True)
 
     st.divider()
 
