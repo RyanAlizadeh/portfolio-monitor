@@ -546,14 +546,14 @@ def compute_rolling_returns(
 
 
 # ── Main computation ─────────────────────────────────────────
+@st.cache_data(show_spinner=False)
 def compute_all(txns: pd.DataFrame, benchmarks: dict,
                 risk_free_rate: float) -> dict:
     all_tickers = list(txns["ticker"].unique()) + list(benchmarks.values())
     all_tickers = list(dict.fromkeys(all_tickers))
     start       = txns["date"].min()
 
-    with st.spinner("Downloading price history from Yahoo Finance…"):
-        prices = download_prices(all_tickers, start)
+    prices = download_prices(all_tickers, start)
 
     # Identify tickers with no price data
     no_data = [t for t in txns["ticker"].unique()
@@ -642,17 +642,39 @@ with st.sidebar:
         default=list(DEFAULT_BENCHMARKS.keys()),
         help="Select which default benchmarks to include in the analysis.",
     )
-    custom_ticker_input = st.text_input(
-        "Add custom benchmark (Yahoo Finance ticker)",
-        placeholder="e.g. SPY, QQQ, IVV",
-        help="Enter any Yahoo Finance ticker to add it as a benchmark.",
-    ).strip().upper()
+
+    # Session state for custom tickers so they persist across reruns
+    if "custom_benchmarks" not in st.session_state:
+        st.session_state.custom_benchmarks = []
+
+    col_input, col_btn = st.columns([3, 1], gap="small")
+    with col_input:
+        new_ticker = st.text_input(
+            "Add custom benchmark",
+            placeholder="e.g. VXUS, VEQT.TO",
+            label_visibility="collapsed",
+        ).strip().upper()
+    with col_btn:
+        # Vertical alignment hack — empty label pushes button down to match input
+        st.write("")
+        add_clicked = st.button("Add", use_container_width=True)
+
+    if add_clicked and new_ticker:
+        if new_ticker not in st.session_state.custom_benchmarks:
+            st.session_state.custom_benchmarks.append(new_ticker)
+
+    # Show added custom tickers with remove buttons
+    for ct in list(st.session_state.custom_benchmarks):
+        c1, c2 = st.columns([4, 1], gap="small")
+        c1.markdown(f"**{ct}**")
+        if c2.button("✕", key=f"remove_{ct}", use_container_width=True):
+            st.session_state.custom_benchmarks.remove(ct)
+            st.rerun()
 
     # Build the active benchmarks dict
     ACTIVE_BENCHMARKS = {k: DEFAULT_BENCHMARKS[k] for k in selected_default_names}
-    if custom_ticker_input:
-        # Use the ticker itself as the display name
-        ACTIVE_BENCHMARKS[custom_ticker_input] = custom_ticker_input
+    for ct in st.session_state.custom_benchmarks:
+        ACTIVE_BENCHMARKS[ct] = ct
 
     st.divider()
 
@@ -740,8 +762,9 @@ if uploaded is not None:
     )
 
     try:
-        results = compute_all(txns, benchmarks=ACTIVE_BENCHMARKS,
-                              risk_free_rate=RISK_FREE_RATE)
+        with st.spinner("Downloading price history and computing metrics…"):
+            results = compute_all(txns, benchmarks=ACTIVE_BENCHMARKS,
+                                  risk_free_rate=RISK_FREE_RATE)
     except Exception as e:
         st.error(f"Error running analysis: {e}")
         st.stop()
