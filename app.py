@@ -742,13 +742,24 @@ if uploaded is not None:
         margin=dict(l=0, r=0, t=10, b=0),
         legend=dict(
             orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0,
-            font=dict(color="#000000", size=13),
+            font=dict(color="#2d2d2d", size=13),
             bgcolor="rgba(255,255,255,0.9)",
             bordercolor="#e2e8f0", borderwidth=1,
         ),
-        xaxis=dict(showgrid=False, color="#000000"),
-        yaxis=dict(title="Growth of 100", gridcolor="#f1f5f9", color="#000000"),
-        font=dict(color="#000000"),
+        xaxis=dict(
+            showgrid=False,
+            linecolor="#2d2d2d",
+            tickfont=dict(color="#2d2d2d", size=12),
+            title_font=dict(color="#2d2d2d"),
+        ),
+        yaxis=dict(
+            title="Growth of 100",
+            gridcolor="#e2e8f0",
+            linecolor="#2d2d2d",
+            tickfont=dict(color="#2d2d2d", size=12),
+            title_font=dict(color="#2d2d2d"),
+        ),
+        font=dict(color="#2d2d2d"),
         plot_bgcolor="white", paper_bgcolor="white",
         hovermode="x unified",
     )
@@ -876,7 +887,7 @@ if uploaded is not None:
             marker_color=chart_data["color"],
             text=chart_data["label"],
             textposition="outside",
-            textfont=dict(size=11, color="#000000"),
+            textfont=dict(size=11, color="#2d2d2d"),
             hovertemplate=(
                 "<b>%{x}</b><br>"
                 "Contribution: %{y:.2f}pp<br>"
@@ -889,21 +900,24 @@ if uploaded is not None:
             margin=dict(l=0, r=0, t=40, b=80),
             title=dict(
                 text="Return Contribution by Security (percentage points)",
-                font=dict(size=13, color="#000000"),
+                font=dict(size=13, color="#2d2d2d"),
             ),
             xaxis=dict(
                 showgrid=False,
-                color="#000000",
+                linecolor="#2d2d2d",
                 tickangle=0,
-                tickfont=dict(size=12, color="#000000"),
+                tickfont=dict(size=12, color="#2d2d2d"),
+                title_font=dict(color="#2d2d2d"),
             ),
             yaxis=dict(
                 title="Contribution (pp)",
-                gridcolor="#f1f5f9",
-                color="#000000",
+                gridcolor="#e2e8f0",
+                linecolor="#2d2d2d",
                 ticksuffix="pp",
+                tickfont=dict(color="#2d2d2d", size=12),
+                title_font=dict(color="#2d2d2d"),
             ),
-            font=dict(color="#000000"),
+            font=dict(color="#2d2d2d"),
             plot_bgcolor="white",
             paper_bgcolor="white",
             showlegend=False,
