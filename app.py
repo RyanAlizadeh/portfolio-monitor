@@ -876,6 +876,7 @@ if uploaded is not None:
             marker_color=chart_data["color"],
             text=chart_data["label"],
             textposition="outside",
+            textfont=dict(size=11, color="#1e293b"),
             hovertemplate=(
                 "<b>%{x}</b><br>"
                 "Contribution: %{y:.2f}pp<br>"
@@ -884,13 +885,18 @@ if uploaded is not None:
         ))
         bar_fig.add_hline(y=0, line_color="#94a3b8", line_width=1)
         bar_fig.update_layout(
-            height=320,
-            margin=dict(l=0, r=0, t=30, b=0),
+            height=400,
+            margin=dict(l=0, r=0, t=40, b=80),
             title=dict(
                 text="Return Contribution by Security (percentage points)",
                 font=dict(size=13, color="#1e293b"),
             ),
-            xaxis=dict(showgrid=False, color="#1e293b"),
+            xaxis=dict(
+                showgrid=False,
+                color="#1e293b",
+                tickangle=0,
+                tickfont=dict(size=12, color="#0f172a"),
+            ),
             yaxis=dict(
                 title="Contribution (pp)",
                 gridcolor="#f1f5f9",
