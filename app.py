@@ -133,9 +133,13 @@ def download_prices(tickers: List[str], start_date: pd.Timestamp) -> pd.DataFram
              else data.to_frame(name=tickers[0])
     prices = prices.dropna(how="all").ffill()
 
-    # Retry bare tickers with .TO suffix (TSX securities)
+    # For tickers that came back empty, retry with .TO suffix — but only
+    # for tickers that look like TSX candidates (no existing suffix, not
+    # obviously US-format). We skip the retry for tickers that already
+    # returned partial data or look like plain US symbols where .TO would
+    # never exist (we still try, but log clearly if both attempts fail).
     missing = [t for t in tickers if t not in prices.columns or prices[t].dropna().empty]
-    retry   = [t for t in missing if not t.endswith(".TO")]
+    retry   = [t for t in missing if not t.endswith(".TO") and "." not in t]
     if retry:
         data2 = yf.download(
             tickers=[t + ".TO" for t in retry],
@@ -151,6 +155,31 @@ def download_prices(tickers: List[str], start_date: pd.Timestamp) -> pd.DataFram
             col = t + ".TO"
             if col in prices2.columns and not prices2[col].dropna().empty:
                 prices[t] = prices2[col]
+
+    # Second retry: any ticker still missing, try individually as both
+    # bare and .TO — we can't reliably tell from the symbol alone whether
+    # a ticker is TSX or US-listed, and rate limits may have dropped either.
+    still_missing = [t for t in tickers
+                     if t not in prices.columns or prices[t].dropna().empty]
+    for t in still_missing:
+        candidates = [t] if t.endswith(".TO") else [t, t + ".TO"]
+        for candidate in candidates:
+            try:
+                single = yf.download(
+                    tickers=candidate,
+                    start=start_date.strftime("%Y-%m-%d"),
+                    auto_adjust=True, actions=True,
+                    progress=False, threads=False,
+                )
+                if not single.empty:
+                    col = "Close" if "Close" in single.columns else single.columns[0]
+                    s = single[col].dropna().ffill()
+                    if not s.empty:
+                        # Always store under the original bare ticker name
+                        prices[t] = s
+                        break  # found data, no need to try the other candidate
+            except Exception:
+                pass
 
     return prices
 
@@ -383,6 +412,86 @@ def build_holdings_table(units_matrix: pd.DataFrame,
     return df
 
 
+# ── Per-security attribution ─────────────────────────────────
+def build_security_attribution(txns: pd.DataFrame,
+                                units_matrix: pd.DataFrame,
+                                prices: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each security, compute:
+      - Total bought / sold
+      - Current market value
+      - Total return (XIRR) on that position alone
+      - Absolute gain/loss in dollars
+
+    Uses the same XIRR logic as the portfolio — buys are outflows,
+    sells are inflows, terminal value is today's market value.
+    """
+    rows = []
+    today = pd.Timestamp("today").normalize()
+
+    for ticker in sorted(txns["ticker"].unique()):
+        ticker_txns = txns[txns["ticker"] == ticker].copy()
+
+        # Current market value of this position
+        if ticker not in units_matrix.columns or ticker not in prices.columns:
+            continue
+        current_units = float(units_matrix[ticker].iloc[-1])
+        price_series  = prices[ticker].ffill().dropna()
+        if price_series.empty:
+            continue
+        current_price = float(price_series.iloc[-1])
+        current_value = current_units * current_price
+
+        total_bought = ticker_txns.loc[ticker_txns["type"] == "BUY",  "amount"].sum()
+        total_sold   = ticker_txns.loc[ticker_txns["type"] == "SELL", "amount"].sum()
+        ni           = total_bought - total_sold
+
+        # XIRR cashflows for this security only
+        cfs = []
+        for _, row in ticker_txns.iterrows():
+            date   = pd.Timestamp(row["date"]).normalize()
+            amount = float(row["amount"])
+            signed = amount if row["type"] == "SELL" else -amount
+            cfs.append((date, signed))
+        cfs.append((today, current_value))
+        cfs.sort(key=lambda x: x[0])
+
+        ann_ret   = xirr(cfs)
+        total_ret = (current_value - ni) / ni if ni > 0 else np.nan
+        abs_gain  = current_value - ni
+
+        rows.append({
+            "Ticker":            ticker,
+            "Total Bought":      total_bought,
+            "Total Sold":        total_sold,
+            "Net Invested":      ni,
+            "Current Value":     current_value,
+            "Gain / Loss ($)":   abs_gain,
+            "Total Return":      total_ret,
+            "Annualized Return": ann_ret,
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    # ── Weighted contribution ─────────────────────────────────
+    # Contribution = (position net invested / total net invested) * annualized return
+    # This answers: "how many percentage points of total return came from this position?"
+    # It properly accounts for both position size AND return rate together,
+    # so a large mediocre position outranks a tiny outstanding one where appropriate.
+    total_ni = df["Net Invested"].sum()
+    if total_ni > 0:
+        df["Portfolio Weight"]  = df["Net Invested"] / total_ni
+        df["Return Contribution"] = df["Portfolio Weight"] * df["Annualized Return"]
+    else:
+        df["Portfolio Weight"]    = np.nan
+        df["Return Contribution"] = np.nan
+
+    df = df.sort_values("Return Contribution", ascending=False).reset_index(drop=True)
+    return df
+
+
 # ── Main computation ─────────────────────────────────────────
 def compute_all(txns: pd.DataFrame) -> dict:
     all_tickers = list(txns["ticker"].unique()) + list(BENCHMARKS.values())
@@ -443,7 +552,8 @@ def compute_all(txns: pd.DataFrame) -> dict:
             "sharpe":                sharpe_ratio(ar, av, RISK_FREE_RATE),
         }
 
-    holdings = build_holdings_table(units_matrix, prices)
+    holdings    = build_holdings_table(units_matrix, prices)
+    attribution = build_security_attribution(txns, units_matrix, prices)
 
     return {
         "txns":              txns,
@@ -457,6 +567,7 @@ def compute_all(txns: pd.DataFrame) -> dict:
         "bm_series":         bm_series,
         "bm_metrics":        bm_metrics,
         "holdings":          holdings,
+        "attribution":       attribution,
     }
 
 
@@ -560,13 +671,14 @@ if uploaded is not None:
             st.dataframe(excl_summary.set_index("Ticker"), use_container_width=True)
             st.markdown("""
 **Why might a ticker be missing?**
-- **Wrong symbol** — Canadian ETFs need `.TO` (e.g. `VFV.TO`). US stocks use plain symbols (e.g. `AAPL`).
-- **Options / warrants** — no continuous price history on Yahoo Finance
-- **GICs / structured notes** — not exchange-traded
-- **Internal account codes** — brokerage labels that aren't real tickers
-- **Delisted or renamed** — the security changed its symbol
+- **Transient download failure** — Yahoo Finance occasionally rate-limits requests. If the ticker is a real security (e.g. `VXUS`, `AAPL`), try re-uploading your CSV — it usually resolves on a second attempt.
+- **Wrong symbol** — Canadian ETFs need the `.TO` suffix (e.g. `VFV.TO` not `VFV`). US-listed securities use their plain symbol (e.g. `VXUS`, `TSLA`).
+- **Options / warrants** — symbols like `GME.WS` have no continuous price history on Yahoo Finance.
+- **GICs / structured notes** — not exchange-traded, no Yahoo Finance ticker.
+- **Internal account codes** — brokerage-specific labels like `WSE200P` that aren't real tickers.
+- **Delisted or renamed** — the security may have changed its symbol.
 
-**What to do:** Search for each ticker at [finance.yahoo.com](https://finance.yahoo.com), copy the exact symbol shown, update your CSV, and re-upload.
+**What to do:** Search for each ticker at [finance.yahoo.com](https://finance.yahoo.com) to confirm the exact symbol. If the ticker looks correct (e.g. `VXUS`), simply re-upload your CSV — transient failures usually clear on retry.
             """)
         st.divider()
 
@@ -688,6 +800,134 @@ if uploaded is not None:
             "Excess Sharpe":    num(pm["sharpe"]                  - m["sharpe"]),
         })
     st.dataframe(pd.DataFrame(beat_rows).set_index("Benchmark"), use_container_width=True)
+
+    st.divider()
+
+    # ── Security attribution ──────────────────────────────────
+    st.subheader("What's Driving Your Returns?")
+    st.caption(
+        "Ranked by **return contribution** — portfolio weight × annualized return. "
+        "Shows which positions are actually driving your results, "
+        "accounting for both size and performance."
+    )
+
+    attr = results["attribution"].copy()
+
+    if not attr.empty:
+        # Filter to securities with valid contribution scores
+        has_ret = attr["Return Contribution"].notna()
+        # Sort by contribution (already done in build_security_attribution,
+        # but re-sort here to be explicit)
+        ranked  = attr[has_ret].sort_values(
+            "Return Contribution", ascending=False
+        ).copy()
+
+        n_show   = min(3, len(ranked))
+        leaders  = ranked.head(n_show)
+        laggards = ranked.tail(n_show).iloc[::-1]  # worst first
+
+        def fmt_attr_row(row):
+            gain     = row["Gain / Loss ($)"]
+            gain_str = f"+{money(gain)}" if gain >= 0 else money(gain)
+            contrib  = row["Return Contribution"]
+            return {
+                "Ticker":               row["Ticker"],
+                "Contribution (pp)":    f"{contrib*100:+.2f}pp" if pd.notna(contrib) else "—",
+                "Annualized Return":    pct(row["Annualized Return"]),
+                "Portfolio Weight":     pct(row["Portfolio Weight"]),
+                "Gain / Loss":          gain_str,
+                "Net Invested":         money(row["Net Invested"]),
+                "Current Value":        money(row["Current Value"]),
+            }
+
+        col_l, col_r = st.columns(2, gap="large")
+
+        with col_l:
+            st.markdown("#### 🟢 Top Contributors")
+            st.caption("Positions adding the most to your portfolio return")
+            leader_rows = [fmt_attr_row(r) for _, r in leaders.iterrows()]
+            st.dataframe(
+                pd.DataFrame(leader_rows).set_index("Ticker"),
+                use_container_width=True,
+            )
+
+        with col_r:
+            st.markdown("#### 🔴 Biggest Laggards")
+            st.caption("Positions dragging down your portfolio return")
+            laggard_rows = [fmt_attr_row(r) for _, r in laggards.iterrows()]
+            st.dataframe(
+                pd.DataFrame(laggard_rows).set_index("Ticker"),
+                use_container_width=True,
+            )
+
+        # Contribution waterfall bar chart
+        chart_data = ranked.copy()
+        chart_data = chart_data[chart_data["Return Contribution"].notna()]
+        chart_data["color"] = chart_data["Return Contribution"].apply(
+            lambda x: "#22c55e" if x >= 0 else "#ef4444"
+        )
+        chart_data["label"] = chart_data["Return Contribution"].apply(
+            lambda x: f"{x*100:+.2f}pp"
+        )
+
+        bar_fig = go.Figure(go.Bar(
+            x=chart_data["Ticker"],
+            y=chart_data["Return Contribution"] * 100,
+            marker_color=chart_data["color"],
+            text=chart_data["label"],
+            textposition="outside",
+            hovertemplate=(
+                "<b>%{x}</b><br>"
+                "Contribution: %{y:.2f}pp<br>"
+                "<extra></extra>"
+            ),
+        ))
+        bar_fig.add_hline(y=0, line_color="#94a3b8", line_width=1)
+        bar_fig.update_layout(
+            height=320,
+            margin=dict(l=0, r=0, t=30, b=0),
+            title=dict(
+                text="Return Contribution by Security (percentage points)",
+                font=dict(size=13, color="#1e293b"),
+            ),
+            xaxis=dict(showgrid=False, color="#1e293b"),
+            yaxis=dict(
+                title="Contribution (pp)",
+                gridcolor="#f1f5f9",
+                color="#1e293b",
+                ticksuffix="pp",
+            ),
+            font=dict(color="#1e293b"),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+            showlegend=False,
+        )
+        st.plotly_chart(bar_fig, use_container_width=True)
+        st.caption(
+            "**Contribution = Portfolio Weight × Annualized Return.** "
+            "Shows how many percentage points each position adds to (or subtracts from) "
+            "your total annualized return. Accounts for both position size and return rate — "
+            "a large mediocre position can outrank a tiny outstanding one."
+        )
+
+        # Full ranked table in expander
+        with st.expander("See all securities ranked by contribution", expanded=False):
+            all_rows = [fmt_attr_row(r) for _, r in ranked.iterrows()]
+            st.dataframe(
+                pd.DataFrame(all_rows).set_index("Ticker"),
+                use_container_width=True,
+            )
+
+        # Unranked tickers (too short a history for XIRR to converge)
+        unranked = attr[~has_ret]
+        if not unranked.empty:
+            st.caption(
+                f"ℹ️ {len(unranked)} ticker(s) excluded from ranking — "
+                "insufficient price history for return calculation: "
+                + ", ".join(unranked["Ticker"].tolist())
+            )
+    else:
+        st.info("No attribution data available.")
 
     st.divider()
 
